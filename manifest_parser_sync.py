@@ -9,6 +9,9 @@ from datetime import datetime, timezone
 import psycopg2
 
 
+SOURCE_KEY = "manifest:arxiv_pdf_manifest"
+
+
 def parse_ts_utc(ts: str):
     """
     В manifest timestamp обычно вида: '2025-12-05 03:59:47'
@@ -24,11 +27,11 @@ def parse_ts_utc(ts: str):
 def iter_manifest_rows(xml_path: str):
     """
     Стрим-парсер: на каждом </file> отдаёт строку.
-    Колонки под твою таблицу pdf_tar_manifest:
-      tar_key, yymm, seq_num, first_item, last_item, num_items, size_bytes, timestamp_utc, content_md5sum, md5sum
     """
     context = ET.iterparse(xml_path, events=("end",))
     for _, elem in context:
+        # на всякий случай, если вдруг namespace:
+        # if not elem.tag.endswith("file"): continue
         if elem.tag != "file":
             continue
 
@@ -36,10 +39,10 @@ def iter_manifest_rows(xml_path: str):
             c = elem.find(tag)
             return (c.text or "").strip() if c is not None and c.text else ""
 
-        tar_key = txt("filename")           # pdf/arXiv_pdf_2511_041.tar
-        yymm = txt("yymm")                  # 2511
-        seq_num = txt("seq_num")            # 41
-        first_item = txt("first_item")      # 2511.05538 / adap-org9801001
+        tar_key = txt("filename")
+        yymm = txt("yymm")
+        seq_num = txt("seq_num")
+        first_item = txt("first_item")
         last_item = txt("last_item")
         num_items = txt("num_items")
         size_bytes = txt("size")
@@ -47,7 +50,6 @@ def iter_manifest_rows(xml_path: str):
         content_md5sum = txt("content_md5sum")
         md5sum = txt("md5sum")
 
-        # базовая валидация
         if not tar_key or not yymm:
             elem.clear()
             continue
@@ -68,10 +70,61 @@ def iter_manifest_rows(xml_path: str):
         elem.clear()
 
 
+# -------------------- sync_state helpers --------------------
+
+def ensure_sync_state(cur):
+    cur.execute("""
+        insert into sync_state(source, updated_at)
+        values (%s, now())
+        on conflict (source) do nothing
+    """, (SOURCE_KEY,))
+
+
+def mark_running(cur, note: str | None):
+    cur.execute("""
+        update sync_state
+        set
+          last_status = 'RUNNING',
+          last_error = null,
+          last_run_started_at = now(),
+          last_run_finished_at = null,
+          updated_at = now(),
+          note = %s
+        where source = %s
+    """, (note, SOURCE_KEY))
+
+
+def mark_success(cur, *, rows_written: int):
+    cur.execute("""
+        update sync_state
+        set
+          last_status = 'OK',
+          last_error = null,
+          last_run_finished_at = now(),
+          last_success_at = now(),
+          last_rows = %s,
+          total_rows = total_rows + %s,
+          updated_at = now()
+        where source = %s
+    """, (rows_written, rows_written, SOURCE_KEY))
+
+
+def mark_error(cur, *, err: str):
+    cur.execute("""
+        update sync_state
+        set
+          last_status = 'ERROR',
+          last_error = left(%s, 8000),
+          last_run_finished_at = now(),
+          last_rows = 0,
+          updated_at = now()
+        where source = %s
+    """, (err, SOURCE_KEY))
+
+
 def copy_via_temp_csv(conn, xml_path: str, truncate: bool, upsert: bool):
     """
-    Самый быстрый вариант:
-    XML -> temp CSV -> COPY into staging -> INSERT (optionally upsert) into target
+    XML -> temp CSV -> COPY into staging -> INSERT/UPSERT into target
     """
     # 1) создаём временный CSV
     with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", newline="", delete=False, suffix=".csv") as tmp:
@@ -84,13 +137,16 @@ def copy_via_temp_csv(conn, xml_path: str, truncate: bool, upsert: bool):
         for row in iter_manifest_rows(xml_path):
             w.writerow(row)
 
+    rows_written = 0
+
     try:
         with conn.cursor() as cur:
+            ensure_sync_state(cur)
+            mark_running(cur, note=f"xml={xml_path}, truncate={truncate}, upsert={upsert}")
+
             if truncate and not upsert:
-                # при upsert можно и не truncate, но иногда удобно
                 cur.execute("truncate table pdf_tar_manifest;")
 
-            # 2) staging таблица
             cur.execute("""
                 create temporary table tmp_pdf_tar_manifest (
                   tar_key        text,
@@ -106,7 +162,6 @@ def copy_via_temp_csv(conn, xml_path: str, truncate: bool, upsert: bool):
                 ) on commit drop;
             """)
 
-            # 3) COPY в staging
             copy_sql = """
                 copy tmp_pdf_tar_manifest(
                     tar_key, yymm, seq_num, first_item, last_item,
@@ -117,7 +172,6 @@ def copy_via_temp_csv(conn, xml_path: str, truncate: bool, upsert: bool):
             with open(csv_path, "r", encoding="utf-8") as f:
                 cur.copy_expert(copy_sql, f)
 
-            # 4) перенос в target
             if upsert:
                 cur.execute("""
                     insert into pdf_tar_manifest(
@@ -140,7 +194,6 @@ def copy_via_temp_csv(conn, xml_path: str, truncate: bool, upsert: bool):
                         md5sum = excluded.md5sum;
                 """)
             else:
-                # просто вставка (ожидаем пустую таблицу или уникальность)
                 cur.execute("""
                     insert into pdf_tar_manifest(
                         tar_key, yymm, seq_num, first_item, last_item,
@@ -152,7 +205,26 @@ def copy_via_temp_csv(conn, xml_path: str, truncate: bool, upsert: bool):
                     from tmp_pdf_tar_manifest;
                 """)
 
+            # rows_written: сколько строк было во временной таблице
+            cur.execute("select count(*) from tmp_pdf_tar_manifest;")
+            rows_written = int(cur.fetchone()[0])
+
+            mark_success(cur, rows_written=rows_written)
+
         conn.commit()
+        return rows_written
+
+    except Exception as e:
+        conn.rollback()
+        try:
+            with conn.cursor() as cur:
+                ensure_sync_state(cur)
+                mark_error(cur, err=repr(e))
+            conn.commit()
+        except Exception:
+            pass
+        raise
+
     finally:
         try:
             os.remove(csv_path)
@@ -163,9 +235,9 @@ def copy_via_temp_csv(conn, xml_path: str, truncate: bool, upsert: bool):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--xml", required=True, help="Путь к arXiv_pdf_manifest.xml")
-    ap.add_argument("--pg", required=True, help="Postgres DSN, например: postgresql://user:pass@localhost:5432/db")
+    ap.add_argument("--pg", required=True, help="Postgres DSN")
     ap.add_argument("--truncate", action="store_true", help="Очистить pdf_tar_manifest перед загрузкой (если без upsert)")
-    ap.add_argument("--upsert", action="store_true", help="ON CONFLICT DO UPDATE по tar_key (можно без truncate)")
+    ap.add_argument("--upsert", action="store_true", help="ON CONFLICT DO UPDATE по tar_key")
     args = ap.parse_args()
 
     if not os.path.exists(args.xml):
@@ -175,31 +247,12 @@ def main():
     conn = psycopg2.connect(args.pg)
     conn.autocommit = False
     try:
-        copy_via_temp_csv(conn, args.xml, truncate=args.truncate, upsert=args.upsert)
+        rows = copy_via_temp_csv(conn, args.xml, truncate=args.truncate, upsert=args.upsert)
     finally:
         conn.close()
 
-    print("DONE: pdf_tar_manifest loaded")
+    print(f"DONE: pdf_tar_manifest loaded. rows={rows}")
 
 
 if __name__ == "__main__":
     main()
-
-
-# С нуля заливка
-# python manifestParser.py `
-#   --xml "C:\Users\User\Desktop\rag\arXiv_pdf_manifest.xml" `
-#   --pg "postgresql://postgres:postgres@localhost:5432/Rag" `
-#   --truncate
-
-
-
-# Апдейт
-# python manifestParser.py `
-#   --xml "C:\Users\User\Desktop\rag\arXiv_pdf_manifest.xml" `
-#   --pg "postgresql://postgres:postgres@localhost:5432/Rag" `
-#   --upsert
-
-
-
-
