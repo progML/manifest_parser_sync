@@ -50,6 +50,7 @@ python .\manifest_parser_sync.py `
 ```sql
 create table if not exists pdf_tar_manifest (
   tar_key        text primary key,          -- pdf/arXiv_pdf_2511_041.tar
+  status         text NOT NULL DEFAULT 'NEW',   -- NEW|PROCESSING|DONE|FAILED
   yymm           char(4) not null,           -- 2511
   seq_num        int not null,               -- 41 (порядок tar внутри месяца)
   first_item     text not null,              -- 2511.05538 или adap-org9801001 и т.п.
@@ -58,7 +59,9 @@ create table if not exists pdf_tar_manifest (
   size_bytes     bigint not null,
   timestamp_utc  timestamptz,                -- время сборки/заливки (UTC)
   content_md5sum text,                       -- md5 контента (как в manifest)
-  md5sum         text                        -- md5 записи/файла (как в manifest)
+  md5sum         text,                        -- md5 записи/файла (как в manifest)
+  updated_at    TIMESTAMPTZ NOT NULL,
+  last_error     text
 );
 
 create index if not exists pdf_tar_manifest_yymm_idx
@@ -66,6 +69,9 @@ create index if not exists pdf_tar_manifest_yymm_idx
 
 create index if not exists pdf_tar_manifest_range_idx
   on pdf_tar_manifest(yymm, first_item, last_item);
+  
+CREATE INDEX IF NOT EXISTS ix_pdf_tar_manifest_status
+  ON pdf_tar_manifest(status);  
 
 ```
 ---

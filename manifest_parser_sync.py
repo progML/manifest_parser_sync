@@ -30,8 +30,6 @@ def iter_manifest_rows(xml_path: str):
     """
     context = ET.iterparse(xml_path, events=("end",))
     for _, elem in context:
-        # на всякий случай, если вдруг namespace:
-        # if not elem.tag.endswith("file"): continue
         if elem.tag != "file":
             continue
 
@@ -132,10 +130,12 @@ def copy_via_temp_csv(conn, xml_path: str, truncate: bool, upsert: bool):
         w = csv.writer(tmp)
         w.writerow([
             "tar_key", "yymm", "seq_num", "first_item", "last_item",
-            "num_items", "size_bytes", "timestamp_utc", "content_md5sum", "md5sum"
+            "num_items", "size_bytes", "timestamp_utc", "content_md5sum", "md5sum",
+            "status", "last_error"
         ])
         for row in iter_manifest_rows(xml_path):
-            w.writerow(row)
+            # status NEW для новых строк, last_error пустой
+            w.writerow((*row, "NEW", None))
 
     rows_written = 0
 
@@ -145,7 +145,7 @@ def copy_via_temp_csv(conn, xml_path: str, truncate: bool, upsert: bool):
             mark_running(cur, note=f"xml={xml_path}, truncate={truncate}, upsert={upsert}")
 
             if truncate and not upsert:
-                cur.execute("truncate table pdf_tar_manifest;")
+                cur.execute("TRUNCATE TABLE pdf_tar_manifest CASCADE;")
 
             cur.execute("""
                 create temporary table tmp_pdf_tar_manifest (
@@ -158,14 +158,17 @@ def copy_via_temp_csv(conn, xml_path: str, truncate: bool, upsert: bool):
                   size_bytes     bigint,
                   timestamp_utc  timestamptz,
                   content_md5sum text,
-                  md5sum         text
+                  md5sum         text,
+                  status         text,
+                  last_error     text
                 ) on commit drop;
             """)
 
             copy_sql = """
                 copy tmp_pdf_tar_manifest(
                     tar_key, yymm, seq_num, first_item, last_item,
-                    num_items, size_bytes, timestamp_utc, content_md5sum, md5sum
+                    num_items, size_bytes, timestamp_utc, content_md5sum, md5sum,
+                    status, last_error
                 )
                 from stdin with (format csv, header true)
             """
@@ -173,14 +176,18 @@ def copy_via_temp_csv(conn, xml_path: str, truncate: bool, upsert: bool):
                 cur.copy_expert(copy_sql, f)
 
             if upsert:
+                # Важно: status и last_error НЕ перезатираем,
+                # чтобы не сбрасывать DONE/PROCESSING/FAILED и не затирать причины ошибок воркера.
                 cur.execute("""
                     insert into pdf_tar_manifest(
                         tar_key, yymm, seq_num, first_item, last_item,
-                        num_items, size_bytes, timestamp_utc, content_md5sum, md5sum
+                        num_items, size_bytes, timestamp_utc, content_md5sum, md5sum,
+                        status, last_error, updated_at
                     )
                     select
                         tar_key, yymm, seq_num, first_item, last_item,
-                        num_items, size_bytes, timestamp_utc, content_md5sum, md5sum
+                        num_items, size_bytes, timestamp_utc, content_md5sum, md5sum,
+                        status, last_error, now()
                     from tmp_pdf_tar_manifest
                     on conflict (tar_key) do update set
                         yymm = excluded.yymm,
@@ -191,21 +198,23 @@ def copy_via_temp_csv(conn, xml_path: str, truncate: bool, upsert: bool):
                         size_bytes = excluded.size_bytes,
                         timestamp_utc = excluded.timestamp_utc,
                         content_md5sum = excluded.content_md5sum,
-                        md5sum = excluded.md5sum;
+                        md5sum = excluded.md5sum,
+                        updated_at = now();
                 """)
             else:
                 cur.execute("""
                     insert into pdf_tar_manifest(
                         tar_key, yymm, seq_num, first_item, last_item,
-                        num_items, size_bytes, timestamp_utc, content_md5sum, md5sum
+                        num_items, size_bytes, timestamp_utc, content_md5sum, md5sum,
+                        status, last_error, updated_at
                     )
                     select
                         tar_key, yymm, seq_num, first_item, last_item,
-                        num_items, size_bytes, timestamp_utc, content_md5sum, md5sum
+                        num_items, size_bytes, timestamp_utc, content_md5sum, md5sum,
+                        status, last_error, now()
                     from tmp_pdf_tar_manifest;
                 """)
 
-            # rows_written: сколько строк было во временной таблице
             cur.execute("select count(*) from tmp_pdf_tar_manifest;")
             rows_written = int(cur.fetchone()[0])
 
