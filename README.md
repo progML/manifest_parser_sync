@@ -15,7 +15,7 @@
 python .\manifest_parser_sync.py `
   --xml "C:\Users\User\Desktop\rag\arXiv_pdf_manifest.xml" `
   --pg "postgresql://postgres:postgres@localhost:5432/Rag" `
-  --truncate
+  --upsert
 ```
 ---
 
@@ -48,30 +48,56 @@ python .\manifest_parser_sync.py `
 Используется для хранения состояния обработки статьи.
 
 ```sql
-create table if not exists pdf_tar_manifest (
-  tar_key        text primary key,          -- pdf/arXiv_pdf_2511_041.tar
-  status         text NOT NULL DEFAULT 'NEW',   -- NEW|PROCESSING|DONE|FAILED
-  yymm           char(4) not null,           -- 2511
-  seq_num        int not null,               -- 41 (порядок tar внутри месяца)
-  first_item     text not null,              -- 2511.05538 или adap-org9801001 и т.п.
-  last_item      text not null,
-  num_items      int not null,
-  size_bytes     bigint not null,
-  timestamp_utc  timestamptz,                -- время сборки/заливки (UTC)
-  content_md5sum text,                       -- md5 контента (как в manifest)
-  md5sum         text,                        -- md5 записи/файла (как в manifest)
-  updated_at    TIMESTAMPTZ NOT NULL,
-  last_error     text
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'tar_status') THEN
+    CREATE TYPE tar_status AS ENUM ('NEW','PROCESSING','DONE','FAILED');
+  END IF;
+END $$;
+
+CREATE TABLE IF NOT EXISTS public.pdf_tar_manifest (
+  tar_key        text PRIMARY KEY,                 -- pdf/arXiv_pdf_2511_041.tar
+
+  -- очередь/воркеры
+  status         tar_status NOT NULL DEFAULT 'NEW',
+  worker_id      text,                             -- кто держит lease
+  locked_at      timestamptz,                      -- lease timestamp
+  attempts       integer NOT NULL DEFAULT 0,        -- сколько раз брали в работу
+  last_error     text,
+
+  -- метаданные из manifest
+  yymm           char(4) NOT NULL,                 -- 2511
+  seq_num        int NOT NULL,                     -- 41
+  first_item     text NOT NULL,                    -- 2511.05538 или adap-org9801001
+  last_item      text NOT NULL,
+  num_items      int NOT NULL,
+  size_bytes     bigint NOT NULL,
+  timestamp_utc  timestamptz,                      -- время сборки/заливки (UTC)
+  content_md5sum text,
+  md5sum         text,
+
+  -- метрики индексации
+  num_items_indexed integer,                       -- сколько pdf реально увидели в tar
+  last_started_at   timestamptz,
+  last_finished_at  timestamptz,
+
+  updated_at     timestamptz NOT NULL DEFAULT now()
 );
 
-create index if not exists pdf_tar_manifest_yymm_idx
-  on pdf_tar_manifest(yymm, seq_num);
+-- индексы под быстрый claim и админку
+CREATE INDEX IF NOT EXISTS idx_pdf_tar_manifest_status_tar
+  ON public.pdf_tar_manifest(status, tar_key);
 
-create index if not exists pdf_tar_manifest_range_idx
-  on pdf_tar_manifest(yymm, first_item, last_item);
-  
-CREATE INDEX IF NOT EXISTS ix_pdf_tar_manifest_status
-  ON pdf_tar_manifest(status);  
+CREATE INDEX IF NOT EXISTS idx_pdf_tar_manifest_yymm_seq
+  ON public.pdf_tar_manifest(yymm, seq_num);
+
+CREATE INDEX IF NOT EXISTS idx_pdf_tar_manifest_range
+  ON public.pdf_tar_manifest(yymm, first_item, last_item);
+
+-- для revive (быстро находить протухшие leases)
+CREATE INDEX IF NOT EXISTS idx_pdf_tar_manifest_locked_at_processing
+  ON public.pdf_tar_manifest(locked_at)
+  WHERE status = 'PROCESSING';
 
 ```
 ---

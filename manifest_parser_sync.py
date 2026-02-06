@@ -123,6 +123,9 @@ def mark_error(cur, *, err: str):
 def copy_via_temp_csv(conn, xml_path: str, truncate: bool, upsert: bool):
     """
     XML -> temp CSV -> COPY into staging -> INSERT/UPSERT into target
+
+    ВАЖНО: если в pdf_tar_manifest.status используется ENUM tar_status,
+    то при вставке делаем явный каст: status::tar_status.
     """
     # 1) создаём временный CSV
     with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", newline="", delete=False, suffix=".csv") as tmp:
@@ -145,6 +148,7 @@ def copy_via_temp_csv(conn, xml_path: str, truncate: bool, upsert: bool):
             mark_running(cur, note=f"xml={xml_path}, truncate={truncate}, upsert={upsert}")
 
             if truncate and not upsert:
+                # если ты включаешь truncate, ты осознанно сбрасываешь очередь
                 cur.execute("TRUNCATE TABLE pdf_tar_manifest CASCADE;")
 
             cur.execute("""
@@ -176,7 +180,7 @@ def copy_via_temp_csv(conn, xml_path: str, truncate: bool, upsert: bool):
                 cur.copy_expert(copy_sql, f)
 
             if upsert:
-                # Важно: status и last_error НЕ перезатираем,
+                # Важно: status и last_error НЕ перезатираем в DO UPDATE,
                 # чтобы не сбрасывать DONE/PROCESSING/FAILED и не затирать причины ошибок воркера.
                 cur.execute("""
                     insert into pdf_tar_manifest(
@@ -187,7 +191,7 @@ def copy_via_temp_csv(conn, xml_path: str, truncate: bool, upsert: bool):
                     select
                         tar_key, yymm, seq_num, first_item, last_item,
                         num_items, size_bytes, timestamp_utc, content_md5sum, md5sum,
-                        status, last_error, now()
+                        status::tar_status, last_error, now()
                     from tmp_pdf_tar_manifest
                     on conflict (tar_key) do update set
                         yymm = excluded.yymm,
@@ -211,7 +215,7 @@ def copy_via_temp_csv(conn, xml_path: str, truncate: bool, upsert: bool):
                     select
                         tar_key, yymm, seq_num, first_item, last_item,
                         num_items, size_bytes, timestamp_utc, content_md5sum, md5sum,
-                        status, last_error, now()
+                        status::tar_status, last_error, now()
                     from tmp_pdf_tar_manifest;
                 """)
 
