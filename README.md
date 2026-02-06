@@ -99,6 +99,11 @@ CREATE INDEX IF NOT EXISTS idx_pdf_tar_manifest_locked_at_processing
   ON public.pdf_tar_manifest(locked_at)
   WHERE status = 'PROCESSING';
 
+
+todo// над индексом выше подумать
+CREATE INDEX idx_manifest_pick
+ON pdf_tar_manifest (status, locked_at)
+WHERE status = 'NEW';
 ```
 ---
 
