@@ -1,51 +1,102 @@
-# arXiv pdf manifest loader
+# manifest_parser_sync
 
-Скрипт для загрузки `arXiv_pdf_manifest.xml` (manifest архива arXiv PDF tar) в PostgreSQL таблицу.
+Загрузчик `arXiv_pdf_manifest.xml` в PostgreSQL.
 
+Скрипт читает XML-манифест arXiv с описанием tar-архивов PDF и заполняет таблицу `pdf_tar_manifest`. Эта таблица используется как карта tar-файлов: по ней можно понять, в каком архиве лежит диапазон arXiv id и какой tar уже обработан, находится в работе или упал с ошибкой.
 
-**Зачем это нужно:** воркеры, которые вытаскивают нужные PDF из `.tar` на arXiv, должны понимать **в каком tar лежит диапазон id** (first_item/last_item).  
-Эта таблица — “карта tar-архивов”.
 ---
 
-## Возможности
+## Что делает проект
 
-### Первичный запуск 
+`manifest_parser_sync.py`:
 
-```bash
-python .\manifest_parser_sync.py `
-  --xml "C:\Users\User\Desktop\rag\arXiv_pdf_manifest.xml" `
-  --pg "postgresql://postgres:postgres@localhost:5432/Rag" `
-  --upsert
-```
+- потоково парсит `arXiv_pdf_manifest.xml`;
+- извлекает метаданные по каждому tar: `tar_key`, `yymm`, `seq_num`, `first_item`, `last_item`, `num_items`, `size_bytes`, `timestamp_utc`, `content_md5sum`, `md5sum`;
+- загружает данные через временный CSV + `COPY` во временную таблицу;
+- затем делает `INSERT` или `UPSERT` в `pdf_tar_manifest`;
+- обновляет `sync_state`, чтобы было видно статус последнего запуска.
+
+Важно: при `--upsert` скрипт обновляет метаданные tar, но не сбрасывает рабочие статусы очереди (`DONE`, `PROCESSING`, `FAILED`) и не перетирает `last_error`.
+
 ---
 
-### Обновление сущностей
+## Где этот проект находится в пайплайне
 
-```bash
-python .\manifest_parser_sync.py `
-  --xml "C:\Users\User\Desktop\rag\arXiv_pdf_manifest.xml" `
-  --pg "postgresql://postgres:postgres@localhost:5432/Rag" `
-  --upsert
-```
+Обычно порядок такой:
+
+1. `oai_suprcon_sync` загружает список статей и базовые метаданные в `arxiv_paper`.
+2. `manifest_parser_sync` загружает карту tar-архивов в `pdf_tar_manifest`.
+3. `index_manifest_tars` читает сами tar-архивы из S3 и строит индекс `tar_key -> arxiv_id` в `pdf_tar_index`.
+4. `tar_workers_sync` использует `arxiv_paper + pdf_tar_index`, скачивает нужные PDF из arXiv S3 и загружает их в целевое S3-хранилище.
+
 ---
 
 ## Требования
 
-- Python 3.10+ (рекомендуется 3.11/3.12/3.13)
+- Python 3.10+
+- PostgreSQL
 - `psycopg2-binary`
 
+Установка:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -U pip
+pip install psycopg2-binary
+```
+
+Для Windows PowerShell:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -U pip
+pip install psycopg2-binary
+```
+
 ---
 
-##  Сущность в бд
+## Быстрый старт
+
+### Upsert-загрузка
+
+```bash
+python manifest_parser_sync.py \
+  --xml /data/arxiv/arXiv_pdf_manifest.xml \
+  --pg postgresql://postgres:postgres@localhost:5432/rag \
+  --upsert
+```
+
+### Полная перезаливка
+
+```bash
+python manifest_parser_sync.py \
+  --xml /data/arxiv/arXiv_pdf_manifest.xml \
+  --pg postgresql://postgres:postgres@localhost:5432/rag \
+  --truncate
+```
+
+### Полная перезаливка с последующим upsert
+
+Обычно не нужна. В типовом случае используют либо `--truncate`, либо `--upsert`.
 
 ---
 
-### Используемые сущности
+## Аргументы CLI
 
+```text
+--xml       Путь к arXiv_pdf_manifest.xml
+--pg        Postgres DSN
+--truncate  Очистить pdf_tar_manifest перед загрузкой
+--upsert    Делать ON CONFLICT DO UPDATE по tar_key
+```
 
-### Тип `pdf_tar_manifest`
+---
 
-Используется для хранения состояния обработки статьи.
+## Схема таблиц
+
+### ENUM статусов tar
 
 ```sql
 DO $$
@@ -54,37 +105,40 @@ BEGIN
     CREATE TYPE tar_status AS ENUM ('NEW','PROCESSING','DONE','FAILED');
   END IF;
 END $$;
+```
 
+### Основная таблица `pdf_tar_manifest`
+
+```sql
 CREATE TABLE IF NOT EXISTS public.pdf_tar_manifest (
-  tar_key        text PRIMARY KEY,                 -- pdf/arXiv_pdf_2511_041.tar
+  tar_key             text PRIMARY KEY,
 
-  -- очередь/воркеры
-  status         tar_status NOT NULL DEFAULT 'NEW',
-  worker_id      text,                             -- кто держит lease
-  locked_at      timestamptz,                      -- lease timestamp
-  attempts       integer NOT NULL DEFAULT 0,        -- сколько раз брали в работу
-  last_error     text,
+  status              tar_status NOT NULL DEFAULT 'NEW',
+  worker_id           text,
+  locked_at           timestamptz,
+  attempts            integer NOT NULL DEFAULT 0,
+  last_error          text,
 
-  -- метаданные из manifest
-  yymm           char(4) NOT NULL,                 -- 2511
-  seq_num        int NOT NULL,                     -- 41
-  first_item     text NOT NULL,                    -- 2511.05538 или adap-org9801001
-  last_item      text NOT NULL,
-  num_items      int NOT NULL,
-  size_bytes     bigint NOT NULL,
-  timestamp_utc  timestamptz,                      -- время сборки/заливки (UTC)
-  content_md5sum text,
-  md5sum         text,
+  yymm                char(4) NOT NULL,
+  seq_num             int NOT NULL,
+  first_item          text NOT NULL,
+  last_item           text NOT NULL,
+  num_items           int NOT NULL,
+  size_bytes          bigint NOT NULL,
+  timestamp_utc       timestamptz,
+  content_md5sum      text,
+  md5sum              text,
 
-  -- метрики индексации
-  num_items_indexed integer,                       -- сколько pdf реально увидели в tar
-  last_started_at   timestamptz,
-  last_finished_at  timestamptz,
-
-  updated_at     timestamptz NOT NULL DEFAULT now()
+  num_items_indexed   integer,
+  last_started_at     timestamptz,
+  last_finished_at    timestamptz,
+  updated_at          timestamptz NOT NULL DEFAULT now()
 );
+```
 
--- индексы под быстрый claim и админку
+### Рекомендуемые индексы
+
+```sql
 CREATE INDEX IF NOT EXISTS idx_pdf_tar_manifest_status_tar
   ON public.pdf_tar_manifest(status, tar_key);
 
@@ -94,54 +148,74 @@ CREATE INDEX IF NOT EXISTS idx_pdf_tar_manifest_yymm_seq
 CREATE INDEX IF NOT EXISTS idx_pdf_tar_manifest_range
   ON public.pdf_tar_manifest(yymm, first_item, last_item);
 
--- для revive (быстро находить протухшие leases)
 CREATE INDEX IF NOT EXISTS idx_pdf_tar_manifest_locked_at_processing
   ON public.pdf_tar_manifest(locked_at)
   WHERE status = 'PROCESSING';
 
-
-todo// над индексом выше подумать
-CREATE INDEX idx_manifest_pick
-ON pdf_tar_manifest (status, locked_at)
-WHERE status = 'NEW';
-```
----
-
-## Разворачивание на сервере
-
-### Установка зависимостей и подтягивание проекта
-
-```bash
-sudo apt update
-sudo apt install -y python3 python3-venv python3-pip
-cd /opt
-git clone https://github.com/progML/manifest_parser_sync.git
-sudo chown -R "$USER":"$USER" /opt/manifest_parser_sync
-cd /opt/manifest_parser_sync
+CREATE INDEX IF NOT EXISTS idx_manifest_pick
+  ON public.pdf_tar_manifest(status, locked_at)
+  WHERE status = 'NEW';
 ```
 
-### Создание виртуального окружения (если сделано в https://github.com/progML/oai_suprcon_sync можно не дублировать)
+### Таблица состояния синхронизации
 
-```bash 
-python3 -m venv .venv
-./.venv/bin/pip install --upgrade pip
-./.venv/bin/pip install requests psycopg2-binary
-source .venv/bin/activate
-pip install -U pip
-pip install requests psycopg2-binary
-deactivate
+Если у вас её ещё нет, удобно использовать такую структуру:
+
+```sql
+CREATE TABLE IF NOT EXISTS sync_state (
+  source                  text PRIMARY KEY,
+  last_status             text,
+  last_error              text,
+  last_run_started_at     timestamptz,
+  last_run_finished_at    timestamptz,
+  last_success_at         timestamptz,
+  last_success_datestamp  date,
+  last_rows               bigint DEFAULT 0,
+  total_rows              bigint DEFAULT 0,
+  note                    text,
+  updated_at              timestamptz NOT NULL DEFAULT now()
+);
 ```
 
 ---
-### Создание systemd service (юнит для запуска)
 
-```bash
-sudo nano /etc/systemd/system/manifest_parser_sync.service
-```
+## Как это работает внутри
 
-Вставить следующие параметры
+1. XML читается потоково через `xml.etree.ElementTree.iterparse`, поэтому файл не нужно целиком держать в памяти.
+2. Для ускорения загрузки формируется временный CSV.
+3. CSV загружается в temp-таблицу через `COPY`.
+4. Из temp-таблицы данные вставляются в `pdf_tar_manifest`.
+5. В `sync_state` записывается состояние запуска: `RUNNING`, `OK` или `ERROR`.
 
-```
+Такой подход обычно заметно быстрее, чем построчные insert'ы в Python.
+
+---
+
+## Типовые сценарии
+
+### 1. Первый запуск
+
+- создайте таблицы;
+- скачайте актуальный `arXiv_pdf_manifest.xml`;
+- выполните запуск с `--upsert`.
+
+### 2. Регулярное обновление
+
+- периодически скачивайте свежий manifest;
+- запускайте скрипт по cron/systemd timer;
+- используйте `--upsert`, чтобы не ломать уже обработанные статусы очереди.
+
+### 3. Полная пересборка среды
+
+- остановите downstream-воркеры;
+- выполните `--truncate`;
+- затем снова прогоните индексацию tar и загрузку PDF.
+
+---
+
+## Пример systemd unit
+
+```ini
 [Unit]
 Description=Load arXiv PDF manifest into Postgres
 After=network.target
@@ -151,28 +225,16 @@ Type=oneshot
 User=arxiv
 Group=arxiv
 WorkingDirectory=/opt/manifest_parser_sync
-
 ExecStart=/opt/manifest_parser_sync/.venv/bin/python /opt/manifest_parser_sync/manifest_parser_sync.py \
   --xml /data/arxiv/arXiv_pdf_manifest.xml \
-  --pg postgresql://postgres:postgres@localhost:5432/Rag \
+  --pg postgresql://postgres:postgres@localhost:5432/rag \
   --upsert
-
 NoNewPrivileges=true
-
-[Install]
-WantedBy=multi-user.target
 ```
 
-### Создание timer
+## Пример timer
 
-
-```bash
-/etc/systemd/system/manifest_parser_sync.timer
-```
-
-Вставить следующие параметры
-
-```
+```ini
 [Unit]
 Description=Run arXiv manifest loader daily
 
@@ -186,23 +248,54 @@ WantedBy=timers.target
 
 ---
 
-### Запуск
+## Проверка результата
 
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now manifest_parser_sync.timer
-systemctl list-timers | grep manifest_parser_sync
+```sql
+SELECT status, count(*)
+FROM pdf_tar_manifest
+GROUP BY status
+ORDER BY status;
 ```
 
-Проверка работы таймера
-
-```bash
-systemctl list-timers | grep manifest_parser_sync
+```sql
+SELECT tar_key, yymm, first_item, last_item, num_items
+FROM pdf_tar_manifest
+ORDER BY yymm DESC, seq_num DESC
+LIMIT 20;
 ```
 
-Просмотр журнала/лог
-
-```bash
-journalctl -u manifest_parser_sync@$(whoami).service -n 100 --no-pager
-journalctl -xeu manifest_parser_sync.service
+```sql
+SELECT *
+FROM sync_state
+WHERE source = 'manifest:arxiv_pdf_manifest';
 ```
+
+---
+
+## Возможные проблемы
+
+### XML не найден
+
+Проверьте путь в `--xml`.
+
+### Ошибка подключения к PostgreSQL
+
+Проверьте DSN и доступность базы.
+
+### Статусы tar сбрасываются
+
+Используйте `--upsert`, а не полную очистку таблицы, если downstream-воркеры уже работают.
+
+### Manifest большой и загрузка долгая
+
+Это нормально: проект специально использует потоковый парсинг и `COPY`, чтобы работать с крупными XML-файлами стабильнее.
+
+---
+
+## Идеи для развития
+
+- вынести DDL в отдельные миграции;
+- добавить `requirements.txt`;
+- добавить dry-run режим;
+- логировать количество новых и обновлённых tar отдельно;
+- валидировать входной XML перед загрузкой.
